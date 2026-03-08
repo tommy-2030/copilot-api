@@ -28,6 +28,9 @@ export const createChatCompletions = async (
     "X-Initiator": isAgentCall ? "agent" : "user",
   }
 
+  // Ensure stream is false if json_schema is used, as it might not be compatible with streaming in some implementations
+  // Or just pass through. For now let's keep it simple.
+
   const response = await fetch(`${copilotBaseUrl(state)}/chat/completions`, {
     method: "POST",
     headers,
@@ -138,7 +141,10 @@ export interface ChatCompletionsPayload {
   presence_penalty?: number | null
   logit_bias?: Record<string, number> | null
   logprobs?: boolean | null
-  response_format?: { type: "json_object" } | null
+  response_format?:
+    | { type: "text" | "json_object" }
+    | { type: "json_schema"; json_schema: Record<string, unknown> }
+    | null
   seed?: number | null
   tools?: Array<Tool> | null
   tool_choice?:

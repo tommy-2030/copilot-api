@@ -23,6 +23,10 @@ modelRoutes.get("/", async (c) => {
       display_name: model.name,
     }))
 
+    // We don't hardcode future models here anymore.
+    // The handler will dynamically create model definitions when they are used.
+    // This avoids needing to update this list for every new model version (gpt-5.5, etc).
+
     return c.json({
       object: "list",
       data: models,

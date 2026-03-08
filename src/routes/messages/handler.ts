@@ -4,13 +4,21 @@ import consola from "consola"
 import { streamSSE } from "hono/streaming"
 
 import { awaitApproval } from "~/lib/approval"
+import { getModelVersion, shouldUseResponsesApi } from "~/lib/model"
 import { checkRateLimit } from "~/lib/rate-limit"
 import { state } from "~/lib/state"
+import {
+  createResponsesStreamState,
+  translateChatToResponsesRequest,
+  translateResponsesEventToChatChunk,
+  translateResponsesToChatResponse,
+} from "~/routes/responses/translation"
 import {
   createChatCompletions,
   type ChatCompletionChunk,
   type ChatCompletionResponse,
 } from "~/services/copilot/create-chat-completions"
+import { createResponse } from "~/services/copilot/create-response"
 
 import {
   type AnthropicMessagesPayload,
@@ -26,30 +34,37 @@ export async function handleCompletion(c: Context) {
   await checkRateLimit(state)
 
   const anthropicPayload = await c.req.json<AnthropicMessagesPayload>()
-  consola.debug("Anthropic request payload:", JSON.stringify(anthropicPayload))
 
   const openAIPayload = translateToOpenAI(anthropicPayload)
-  consola.debug(
-    "Translated OpenAI request payload:",
-    JSON.stringify(openAIPayload),
-  )
 
   if (state.manualApprove) {
     await awaitApproval()
   }
 
-  const response = await createChatCompletions(openAIPayload)
+  // Route to createResponse for models >= 5.4 or explicitly "gpt-5.4"
+  const version = getModelVersion(openAIPayload.model)
+  const useResponsesApi = shouldUseResponsesApi(openAIPayload.model)
+
+  consola.info(`Anthropic Model Translated: ${openAIPayload.model}, Version: ${version}`)
+
+  let response
+  if (useResponsesApi) {
+    consola.info(`Routing Anthropic model ${openAIPayload.model} (>= 5.4) to Responses API (/v1/responses)`)
+    response = await createResponse(translateChatToResponsesRequest(openAIPayload))
+  } else {
+    consola.info(`Routing Anthropic model ${openAIPayload.model} (< 5.4) to Chat Completions API`)
+    response = await createChatCompletions(openAIPayload)
+  }
+
+  if (useResponsesApi && !isStreamingResponse(response)) {
+    const anthropicResponse = translateToAnthropic(
+      translateResponsesToChatResponse(response),
+    )
+    return c.json(anthropicResponse)
+  }
 
   if (isNonStreaming(response)) {
-    consola.debug(
-      "Non-streaming response from Copilot:",
-      JSON.stringify(response).slice(-400),
-    )
     const anthropicResponse = translateToAnthropic(response)
-    consola.debug(
-      "Translated Anthropic response:",
-      JSON.stringify(anthropicResponse),
-    )
     return c.json(anthropicResponse)
   }
 
@@ -61,9 +76,9 @@ export async function handleCompletion(c: Context) {
       contentBlockOpen: false,
       toolCalls: {},
     }
+    const responsesStreamState = createResponsesStreamState(openAIPayload.model)
 
     for await (const rawEvent of response) {
-      consola.debug("Copilot raw stream event:", JSON.stringify(rawEvent))
       if (rawEvent.data === "[DONE]") {
         break
       }
@@ -72,11 +87,18 @@ export async function handleCompletion(c: Context) {
         continue
       }
 
-      const chunk = JSON.parse(rawEvent.data) as ChatCompletionChunk
+      const chunk =
+        useResponsesApi ?
+          translateResponsesEventToChatChunk(rawEvent.data, responsesStreamState)
+        : (JSON.parse(rawEvent.data) as ChatCompletionChunk)
+
+      if (!chunk) {
+        continue
+      }
+
       const events = translateChunkToAnthropicEvents(chunk, streamState)
 
       for (const event of events) {
-        consola.debug("Translated Anthropic event:", JSON.stringify(event))
         await stream.writeSSE({
           event: event.type,
           data: JSON.stringify(event),
@@ -87,5 +109,9 @@ export async function handleCompletion(c: Context) {
 }
 
 const isNonStreaming = (
-  response: Awaited<ReturnType<typeof createChatCompletions>>,
+  response: Awaited<ReturnType<typeof createChatCompletions>> | Awaited<ReturnType<typeof createResponse>>,
 ): response is ChatCompletionResponse => Object.hasOwn(response, "choices")
+
+const isStreamingResponse = (
+  response: Awaited<ReturnType<typeof createResponse>> | Awaited<ReturnType<typeof createChatCompletions>>,
+): response is AsyncIterable<{ data?: string }> => !Object.hasOwn(response, "choices") && !Object.hasOwn(response, "object")
